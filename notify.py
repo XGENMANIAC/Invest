@@ -150,11 +150,12 @@ def notify_event(
     human_label, default_priority, tag, prefix = _EVENT_META[key]
     priority = _normalise_priority(priority_override) if priority_override else default_priority
 
-    title = f"{prefix} {symbol} — {human_label}"
+    # Title must be Latin-1 safe (HTTP header); emoji goes in the body instead.
+    title = f"{symbol} - {human_label}"
 
-    body = message
+    body = f"{prefix} {message}"
     if current_price is not None:
-        body = f"{message}\nPrice: {current_price:,.2f}"
+        body = f"{prefix} {message}\nPrice: {current_price:,.2f}"
 
     return notify(title, body, priority=priority, tags=[tag], click_url=click_url)
 
@@ -166,7 +167,7 @@ if __name__ == "__main__":
     print("Sending test notifications …")
 
     tests = [
-        (EventType.ENTRY_TRIGGER,   "BTCUSDT",  "retest of 65,400 confirmed — entry zone active", 65_412.50),
+        (EventType.ENTRY_TRIGGER,   "BTCUSDT",  "retest of 65,400 confirmed - entry zone active", 65_412.50),
         (EventType.STOP_RISK,       "ETHUSDT",  "price dropped below support — check stop",        3_480.00),
         (EventType.TARGET_HIT,      "SOLUSDT",  "TP1 reached at 175",                              175.10),
         (EventType.RANGE_STALL,     "BNBUSDT",  "no movement for 2 h — watching",                  None),
