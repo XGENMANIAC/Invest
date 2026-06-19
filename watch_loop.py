@@ -47,7 +47,7 @@ TIMEFRAME_TO_YF: dict[str, tuple[str, str]] = {
 }
 
 # How many bars back to look for a price "touch" before checking close confirmation
-TOUCH_LOOKBACK = 10
+TOUCH_LOOKBACK = 5  # bars back to search for a touch; 5 bars keeps it to ~25min on 5m
 
 # Price within this multiple of tolerance triggers a one-time APPROACHING heads-up
 APPROACHING_MULTIPLIER = 2.0
@@ -193,6 +193,21 @@ def _fetch_candles(ticker: str, interval: str, yf_range: str) -> Candles | None:
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         _log(f"Parse error ({ticker}): {exc}")
         return None
+
+
+def _is_fresh(candles: "Candles", tf: str) -> tuple[bool, float]:
+    """
+    Return (is_fresh: bool, age_minutes: float).
+    Data is considered stale when the latest candle is older than max(10x the
+    timeframe interval, 60 min). This catches weekend/market-closed freezes while
+    tolerating normal intraday exchange pauses.
+    """
+    if not candles or not candles.timestamps:
+        return False, float("inf")
+    age_min = (time.time() - candles.timestamps[-1]) / 60
+    tf_min  = _timeframe_minutes(tf)
+    threshold = max(tf_min * 10, 60)  # at least 60 min; generous for exchange breaks
+    return age_min <= threshold, age_min
 
 # ── INDICATORS (pure Python, deterministic) ───────────────────────────────────
 

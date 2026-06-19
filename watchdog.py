@@ -29,6 +29,7 @@ with warnings.catch_warnings():
         TIMEFRAME_TO_YF,
         _check_approaching,
         _fetch_candles,
+        _is_fresh,
         _resolve_ticker,
         evaluate_conditions,
     )
@@ -114,7 +115,8 @@ def _watch_thread(entry: dict) -> None:
                 try:
                     notify_event(
                         timeout_ev, symbol,
-                        f"watch window expired after {elapsed_min:.0f}min, no trigger",
+                        f"[TIMEOUT — NOT A TRIGGER] Watch {wid} expired after "
+                        f"{elapsed_min:.0f}min. Condition was never met. No action needed.",
                     )
                 except Exception as exc:
                     _log(f"[{wid}] Notify error: {exc}")
@@ -129,6 +131,17 @@ def _watch_thread(entry: dict) -> None:
 
         if candles is None:
             _log(f"[{wid}] Tick {tick} | No data — retrying next tick")
+            _prompt()
+            stop_event.wait(poll_seconds)
+            continue
+
+        # ── Staleness guard — skip evaluation on frozen/weekend data ──────
+        fresh, age_min = _is_fresh(candles, timeframe)
+        if not fresh:
+            _log(
+                f"[{wid}] Tick {tick} | Data stale ({age_min:.0f}min old)"
+                f" — market likely closed. Skipping evaluation, will retry."
+            )
             _prompt()
             stop_event.wait(poll_seconds)
             continue
