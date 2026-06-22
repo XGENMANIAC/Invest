@@ -6,8 +6,8 @@ already happened once, in goal_parser.py. This loop only does math.
 Execution of any trade stays entirely human-confirmed — this loop notifies only.
 
 Dependencies: requests only (already installed). No pandas. No yfinance.
-Market data is fetched via the Twelve Data REST API (https://twelvedata.com).
-Requires TWELVE_API_KEY environment variable.
+Market data: Twelve Data (primary) + Finnhub (fallback). Both are free-tier
+compatible. Combined rate limit: 8 + 60 = 68 req/min — enough for ~11 watches.
 """
 
 import math
@@ -25,48 +25,57 @@ import requests
 from notify import notify_event
 
 # ── TWELVE DATA CONFIG ────────────────────────────────────────────────────────
-TWELVE_BASE_URL  = "https://api.twelvedata.com"
+TWELVE_BASE_URL   = "https://api.twelvedata.com"
 TWELVE_OUTPUTSIZE = 50   # candles per request; 50 covers all indicators + buffer
-TWELVE_API_KEY   = os.environ.get("TWELVE_API_KEY", "")
-if not TWELVE_API_KEY:
+TWELVE_RATE_LIMIT = int(os.environ.get("TWELVE_RATE_LIMIT", "8"))  # free: 8/min; paid: 55
+TWELVE_API_KEY    = os.environ.get("TWELVE_API_KEY", "")
+
+# ── FINNHUB CONFIG ────────────────────────────────────────────────────────────
+FINNHUB_BASE_URL   = "https://finnhub.io/api/v1"
+FINNHUB_RATE_LIMIT = int(os.environ.get("FINNHUB_RATE_LIMIT", "55"))  # free tier: 60/min
+FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY", "")
+
+if not TWELVE_API_KEY and not FINNHUB_API_KEY:
     warnings.warn(
-        "[watch_loop] TWELVE_API_KEY env var is not set. "
-        "Market data fetching will fail until it is set.",
+        "[watch_loop] Neither TWELVE_API_KEY nor FINNHUB_API_KEY is set. "
+        "Set at least one to enable market data.",
         stacklevel=2,
     )
 
-# ── RATE LIMITER (shared across all watch threads) ───────────────────────────
-# Free tier: 8 req/min. Set TWELVE_RATE_LIMIT=55 for Grow/paid tiers.
-TWELVE_RATE_LIMIT = int(os.environ.get("TWELVE_RATE_LIMIT", "8"))
-_rate_lock  = threading.Lock()
-_req_times: collections.deque = collections.deque()
+# ── NON-BLOCKING RATE LIMITERS (per provider, shared across all watch threads) ─
+# Each returns True and records the request if a slot is free; False otherwise.
+# _fetch_candles tries TD first, falls over to FH instantly — never blocks.
 
-def _rate_wait() -> None:
-    """
-    Sliding-window rate limiter. Blocks until the rate limit allows a request.
-    Sleeps in 0.5s chunks so callers remain cancellable.
-    """
-    window = 60.0
-    while True:
-        with _rate_lock:
-            now = time.time()
-            while _req_times and now - _req_times[0] >= window:
-                _req_times.popleft()
-            if len(_req_times) < TWELVE_RATE_LIMIT:
-                _req_times.append(now)
-                return
-            wait_until = _req_times[0] + window + 0.05
-        wait = wait_until - time.time()
-        if wait > 2.0:
-            _log(
-                f"Rate-limited ({len(_req_times)}/{TWELVE_RATE_LIMIT} req/min used) — "
-                f"pausing {wait:.0f}s. Too many active watches for the free tier. "
-                f"Set TWELVE_RATE_LIMIT=55 if you have a paid plan."
-            )
-        time.sleep(min(max(wait, 0.0), 0.5))  # re-check every 0.5s max
+_td_lock  = threading.Lock()
+_td_times: collections.deque = collections.deque()
 
-# ── SYMBOL → TICKER MAP ───────────────────────────────────────────────────────
-# Edit here to add instruments. Key = what you type, value = Twelve Data symbol.
+_fh_lock  = threading.Lock()
+_fh_times: collections.deque = collections.deque()
+
+
+def _td_rate_try() -> bool:
+    with _td_lock:
+        now = time.time()
+        while _td_times and now - _td_times[0] >= 60.0:
+            _td_times.popleft()
+        if len(_td_times) < TWELVE_RATE_LIMIT:
+            _td_times.append(now)
+            return True
+    return False
+
+
+def _fh_rate_try() -> bool:
+    with _fh_lock:
+        now = time.time()
+        while _fh_times and now - _fh_times[0] >= 60.0:
+            _fh_times.popleft()
+        if len(_fh_times) < FINNHUB_RATE_LIMIT:
+            _fh_times.append(now)
+            return True
+    return False
+
+# ── SYMBOL MAPS ───────────────────────────────────────────────────────────────
+# Primary: Twelve Data symbols (what you type → TD ticker)
 SYMBOL_TO_TICKER: dict[str, str] = {
     "GOLD":   "XAU/USD",
     "SILVER": "XAG/USD",
@@ -84,12 +93,46 @@ SYMBOL_TO_TICKER: dict[str, str] = {
     "SOLUSD": "SOL/USD",
 }
 
+# Fallback: Finnhub symbols — (fh_symbol, endpoint_type)
+# endpoint_type: "forex" | "crypto"  (Finnhub uses separate endpoints per asset class)
+SYMBOL_TO_FH: dict[str, tuple[str, str]] = {
+    "GOLD":   ("OANDA:XAU_USD",  "forex"),
+    "SILVER": ("OANDA:XAG_USD",  "forex"),
+    "OIL":    ("OANDA:BCO_USD",  "forex"),   # Brent crude; WTI not always available on OANDA
+    "EURUSD": ("OANDA:EUR_USD",  "forex"),
+    "GBPUSD": ("OANDA:GBP_USD",  "forex"),
+    "USDJPY": ("OANDA:USD_JPY",  "forex"),
+    "AUDUSD": ("OANDA:AUD_USD",  "forex"),
+    "USDCAD": ("OANDA:USD_CAD",  "forex"),
+    "USDCHF": ("OANDA:USD_CHF",  "forex"),
+    "NZDUSD": ("OANDA:NZD_USD",  "forex"),
+    "BTCUSD": ("BINANCE:BTCUSDT", "crypto"),
+    "ETHUSD": ("BINANCE:ETHUSDT", "crypto"),
+    "BNBUSD": ("BINANCE:BNBUSDT", "crypto"),
+    "SOLUSD": ("BINANCE:SOLUSDT", "crypto"),
+}
+
+# Reverse map: Twelve Data ticker → Finnhub (symbol, type) for _fetch_candles dispatcher
+_TD_TO_FH: dict[str, tuple[str, str]] = {
+    SYMBOL_TO_TICKER[k]: SYMBOL_TO_FH[k]
+    for k in SYMBOL_TO_TICKER
+    if k in SYMBOL_TO_FH
+}
+
 # Twelve Data interval strings per rule timeframe
 TIMEFRAME_TO_TWELVE: dict[str, str] = {
     "1m":  "1min",
     "5m":  "5min",
     "15m": "15min",
     "1h":  "1h",
+}
+
+# Finnhub resolution strings per Twelve Data interval string
+_TD_INT_TO_FH_RES: dict[str, str] = {
+    "1min": "1",
+    "5min": "5",
+    "15min": "15",
+    "1h":   "60",
 }
 
 # How many bars back to look for a price "touch" before checking close confirmation
@@ -175,27 +218,18 @@ def _keep_awake():
         print(f"[watch] wakepy unavailable ({exc}) — continuing without it.", file=sys.stderr)
         return nullcontext()
 
-# ── DATA FETCHING (Twelve Data REST API) ─────────────────────────────────────
+# ── DATA FETCHING ─────────────────────────────────────────────────────────────
 
 def _td_ts(dt_str: str) -> float:
-    """Parse a Twelve Data UTC datetime string (YYYY-MM-DD HH:MM:SS) to Unix timestamp."""
+    """Parse a Twelve Data UTC datetime string to a Unix timestamp."""
     try:
         return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
     except (ValueError, AttributeError):
         return 0.0
 
 
-def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
-    """
-    Fetch OHLCV candles from the Twelve Data time-series endpoint.
-    Returns Candles (ascending, newest last) or None on any failure.
-    """
-    if not TWELVE_API_KEY:
-        _log("TWELVE_API_KEY is not set — cannot fetch market data")
-        return None
-
-    _rate_wait()
-
+def _fetch_from_twelve(ticker: str, interval: str) -> "Candles | None":
+    """Fetch from Twelve Data. Caller must have already acquired a rate-limit slot."""
     try:
         resp = requests.get(
             f"{TWELVE_BASE_URL}/time_series",
@@ -213,16 +247,15 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
         data = resp.json()
     except requests.RequestException as exc:
         msg = str(exc).replace(TWELVE_API_KEY, "<key>")
-        _log(f"Fetch failed ({ticker}): {msg}")
+        _log(f"[TD] Fetch failed ({ticker}): {msg}")
         return None
 
     if data.get("status") == "error":
-        _log(f"Twelve Data error ({ticker}): {data.get('message', data)}")
+        _log(f"[TD] Error ({ticker}): {data.get('message', data)}")
         return None
 
     values = data.get("values")
     if not values:
-        _log(f"No candle data returned for {ticker}")
         return None
 
     try:
@@ -237,16 +270,98 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
             l_.append(_to_float(row.get("low")))
             c_.append(cv)
             v_.append(_to_float(row.get("volume", 0)))
-
-        if not ts_:
-            _log(f"No valid candles after filtering for {ticker}")
-            return None
-
-        return Candles(ts_, o_, h_, l_, c_, v_)
-
-    except (KeyError, TypeError, ValueError) as exc:
-        _log(f"Parse error ({ticker}): {exc}")
+        return Candles(ts_, o_, h_, l_, c_, v_) if ts_ else None
+    except (KeyError, TypeError, ValueError):
         return None
+
+
+def _fetch_from_finnhub(fh_ticker: str, fh_type: str, resolution: str) -> "Candles | None":
+    """
+    Fetch from Finnhub candle endpoint. Caller must have already acquired a rate-limit slot.
+    fh_type: 'forex' | 'crypto'  (selects the right Finnhub endpoint)
+    resolution: Finnhub resolution string ('1', '5', '15', '60')
+    """
+    tf_min  = int(resolution) if resolution.isdigit() else 60
+    now_ts  = int(time.time())
+    # 7-day window ensures we get candles even after weekends/holidays
+    from_ts = now_ts - 7 * 24 * 3600
+
+    try:
+        resp = requests.get(
+            f"{FINNHUB_BASE_URL}/{fh_type}/candle",
+            params={
+                "symbol":     fh_ticker,
+                "resolution": resolution,
+                "from":       from_ts,
+                "to":         now_ts,
+                "token":      FINNHUB_API_KEY,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
+        msg = str(exc).replace(FINNHUB_API_KEY, "<key>")
+        _log(f"[FH] Fetch failed ({fh_ticker}): {msg}")
+        return None
+
+    if data.get("s") != "ok":
+        if data.get("s") == "no_data":
+            _log(f"[FH] No data for {fh_ticker}")
+        else:
+            _log(f"[FH] Error ({fh_ticker}): {data}")
+        return None
+
+    try:
+        rows = [
+            (ts, ov, hv, lv, cv, vv)
+            for ts, ov, hv, lv, cv, vv in zip(
+                data.get("t", []),
+                (_to_float(v) for v in data.get("o", [])),
+                (_to_float(v) for v in data.get("h", [])),
+                (_to_float(v) for v in data.get("l", [])),
+                (_to_float(v) for v in data.get("c", [])),
+                (_to_float(v) for v in data.get("v", [])),
+            )
+            if not _nan(cv)
+        ]
+        rows = rows[-TWELVE_OUTPUTSIZE:]  # keep most recent N candles
+        if not rows:
+            return None
+        ts_, o_, h_, l_, c_, v_ = map(list, zip(*rows))
+        return Candles(ts_, o_, h_, l_, c_, v_)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
+    """
+    Fetch OHLCV candles using Twelve Data + Finnhub as parallel sources.
+    Tries Twelve Data first (non-blocking). Falls over to Finnhub immediately
+    if Twelve Data is rate-limited or returns no data. Never blocks.
+
+    ticker:   Twelve Data ticker (e.g. 'XAU/USD'). Finnhub ticker is looked
+              up via _TD_TO_FH.
+    interval: Twelve Data interval string (e.g. '15min').
+    """
+    # ── Twelve Data ──────────────────────────────────────────────────────────
+    if TWELVE_API_KEY and _td_rate_try():
+        result = _fetch_from_twelve(ticker, interval)
+        if result is not None:
+            return result
+
+    # ── Finnhub fallback ─────────────────────────────────────────────────────
+    fh_info = _TD_TO_FH.get(ticker)
+    if fh_info and FINNHUB_API_KEY and _fh_rate_try():
+        fh_ticker, fh_type = fh_info
+        resolution = _TD_INT_TO_FH_RES.get(interval, "15")
+        result = _fetch_from_finnhub(fh_ticker, fh_type, resolution)
+        if result is not None:
+            return result
+
+    if not TWELVE_API_KEY and not FINNHUB_API_KEY:
+        _log("No API keys configured. Set TWELVE_API_KEY and/or FINNHUB_API_KEY.")
+    return None
 
 
 def _is_fresh(candles: "Candles", tf: str) -> tuple[bool, float]:

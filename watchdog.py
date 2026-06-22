@@ -28,6 +28,7 @@ with warnings.catch_warnings():
         SYMBOL_TO_TICKER,
         TIMEFRAME_TO_TWELVE,
         TWELVE_API_KEY,
+        FINNHUB_API_KEY,
         _check_approaching,
         _fetch_candles,
         _is_fresh,
@@ -405,10 +406,11 @@ def _cmd_help() -> None:
 # ── STARTUP ─────────────────────────────────────────────────────────────────────
 
 def _print_banner() -> None:
-    topic_ok  = bool(NTFY_TOPIC and NTFY_TOPIC != _PLACEHOLDER)
-    nim_ok    = bool(NIM_API_KEY)
-    twelve_ok = bool(TWELVE_API_KEY)
-    W = 56  # inner content width
+    topic_ok   = bool(NTFY_TOPIC and NTFY_TOPIC != _PLACEHOLDER)
+    nim_ok     = bool(NIM_API_KEY)
+    twelve_ok  = bool(TWELVE_API_KEY)
+    finnhub_ok = bool(FINNHUB_API_KEY)
+    W = 56
 
     def row(s: str) -> None:
         print(f"║{s.ljust(W)}║")
@@ -417,10 +419,11 @@ def _print_banner() -> None:
     print("╔" + "═" * W + "╗")
     row("              Trading Watchdog")
     print("╠" + "═" * W + "╣")
-    row(f"  Notifier  : ntfy.sh topic  {'[SET]' if topic_ok else '[NOT SET]'}")
-    row(f"  Data      : Twelve Data    {'[SET]' if twelve_ok else '[NOT SET — data disabled]'}")
-    row(f"  Parser    : {NIM_MODEL} via NIM")
-    row(f"  NIM key   : {'[SET]' if nim_ok else '[NOT SET — parsing disabled]'}")
+    row(f"  Notifier   : ntfy.sh topic  {'[SET]' if topic_ok else '[NOT SET]'}")
+    row(f"  Data (pri) : Twelve Data    {'[SET]' if twelve_ok else '[NOT SET]'}")
+    row(f"  Data (bkp) : Finnhub        {'[SET]' if finnhub_ok else '[NOT SET]'}")
+    row(f"  Parser     : {NIM_MODEL} via NIM")
+    row(f"  NIM key    : {'[SET]' if nim_ok else '[NOT SET — parsing disabled]'}")
     print("╠" + "═" * W + "╣")
     row("  This app watches and notifies only. It never places or")
     row("  modifies trades. When a watch triggers, confirm the")
@@ -433,8 +436,10 @@ def _check_env() -> None:
     warnings_found = []
     if not NIM_API_KEY:
         warnings_found.append("NIM_API_KEY is not set    →  export NIM_API_KEY=your_nvidia_nim_key")
-    if not TWELVE_API_KEY:
-        warnings_found.append("TWELVE_API_KEY is not set →  export TWELVE_API_KEY=your_twelvedata_key")
+    if not TWELVE_API_KEY and not FINNHUB_API_KEY:
+        warnings_found.append(
+            "No data source set        →  export TWELVE_API_KEY=... and/or FINNHUB_API_KEY=..."
+        )
     if not NTFY_TOPIC or NTFY_TOPIC == _PLACEHOLDER:
         warnings_found.append("NTFY_TOPIC is not set     →  export NTFY_TOPIC=your_secret_topic")
 
