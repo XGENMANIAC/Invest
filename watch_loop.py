@@ -5,16 +5,16 @@ BOUNDARY: This module NEVER calls any AI model. All language understanding
 already happened once, in goal_parser.py. This loop only does math.
 Execution of any trade stays entirely human-confirmed — this loop notifies only.
 
-Dependencies: requests only (already installed). No pandas. No yfinance.
-Market data: Twelve Data (primary) + Finnhub (fallback). Both are free-tier
-compatible. Combined rate limit: 8 + 60 = 68 req/min — enough for ~11 watches.
+Dependencies: requests only (already installed). No pandas. No yfinance library.
+Market data: Twelve Data (primary) → Finnhub (secondary) → Yahoo Finance (built-in fallback).
+TD free tier: 8 req/min. Finnhub free tier: 60 req/min (crypto only on free).
+Yahoo Finance: no key, no rate limit — always available as universal fallback.
 """
 
 import math
 import os
 import sys
 import time
-import warnings
 import collections
 import threading
 from contextlib import nullcontext
@@ -34,13 +34,6 @@ TWELVE_API_KEY    = os.environ.get("TWELVE_API_KEY", "")
 FINNHUB_BASE_URL   = "https://finnhub.io/api/v1"
 FINNHUB_RATE_LIMIT = int(os.environ.get("FINNHUB_RATE_LIMIT", "55"))  # free tier: 60/min
 FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY", "")
-
-if not TWELVE_API_KEY and not FINNHUB_API_KEY:
-    warnings.warn(
-        "[watch_loop] Neither TWELVE_API_KEY nor FINNHUB_API_KEY is set. "
-        "Set at least one to enable market data.",
-        stacklevel=2,
-    )
 
 # ── NON-BLOCKING RATE LIMITERS (per provider, shared across all watch threads) ─
 # Each returns True and records the request if a slot is free; False otherwise.
@@ -133,6 +126,48 @@ _TD_INT_TO_FH_RES: dict[str, str] = {
     "5min": "5",
     "15min": "15",
     "1h":   "60",
+}
+
+# ── YAHOO FINANCE MAPS (built-in fallback, no key required) ──────────────────
+# Yahoo Finance v8 chart API — requires cookie session + crumb since late 2023.
+_YF_CHART_URLS = [
+    "https://query1.finance.yahoo.com/v8/finance/chart/",
+    "https://query2.finance.yahoo.com/v8/finance/chart/",
+]
+_YF_COOKIE_SEED = "https://fc.yahoo.com"                               # seeds cookies
+_YF_CRUMB_URL   = "https://query2.finance.yahoo.com/v1/test/getcrumb"  # returns crumb text
+_YF_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# Session state — initialised lazily, refreshed on 401/403
+_yf_lock:    threading.Lock        = threading.Lock()
+_yf_session: "requests.Session | None" = None
+_yf_crumb:   str                   = ""
+# Twelve Data ticker → Yahoo Finance ticker
+_TD_TO_YF: dict[str, str] = {
+    "XAU/USD": "GC=F",
+    "XAG/USD": "SI=F",
+    "WTI/USD": "CL=F",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "USD/CHF": "USDCHF=X",
+    "NZD/USD": "NZDUSD=X",
+    "BTC/USD": "BTC-USD",
+    "ETH/USD": "ETH-USD",
+    "BNB/USD": "BNB-USD",
+    "SOL/USD": "SOL-USD",
+}
+# Twelve Data interval string → (yf_interval, yf_range)
+_TD_INT_TO_YF: dict[str, tuple[str, str]] = {
+    "1min":  ("1m",  "1d"),
+    "5min":  ("5m",  "5d"),
+    "15min": ("15m", "5d"),
+    "1h":    ("60m", "30d"),
 }
 
 # How many bars back to look for a price "touch" before checking close confirmation
@@ -334,14 +369,97 @@ def _fetch_from_finnhub(fh_ticker: str, fh_type: str, resolution: str) -> "Candl
         return None
 
 
+def _yf_refresh_session() -> bool:
+    """(Re)init Yahoo Finance session — seeds cookies then fetches crumb. Caller holds _yf_lock."""
+    global _yf_session, _yf_crumb
+    sess = requests.Session()
+    sess.headers["User-Agent"] = _YF_UA
+    try:
+        sess.get(_YF_COOKIE_SEED, timeout=10)        # sets cookies
+        r = sess.get(_YF_CRUMB_URL, timeout=10)
+        if r.ok and r.text.strip():
+            _yf_session, _yf_crumb = sess, r.text.strip()
+            return True
+    except Exception as exc:
+        _log(f"[YF] Session init failed: {exc}")
+    return False
+
+
+def _fetch_from_yahoo(yf_ticker: str, yf_interval: str, yf_range: str) -> "Candles | None":
+    """
+    Fetch from Yahoo Finance v8 chart API (no API key required).
+    Maintains a cookie+crumb session; refreshes it automatically on 401/403.
+    """
+    global _yf_session, _yf_crumb
+
+    for attempt in range(2):        # attempt 0 = normal; attempt 1 = after session refresh
+        with _yf_lock:
+            if not _yf_session or not _yf_crumb:
+                if not _yf_refresh_session():
+                    return None
+            sess, crumb = _yf_session, _yf_crumb
+
+        for base in _YF_CHART_URLS:
+            try:
+                resp = sess.get(
+                    f"{base}{yf_ticker}",
+                    params={"interval": yf_interval, "range": yf_range, "crumb": crumb},
+                    timeout=15,
+                )
+            except requests.RequestException as exc:
+                _log(f"[YF] Network error ({yf_ticker}): {exc}")
+                continue
+
+            if resp.status_code in (401, 403) and attempt == 0:
+                # Auth expired — invalidate and retry once
+                with _yf_lock:
+                    _yf_crumb = ""
+                break   # break inner; outer loop retries with fresh session
+
+            try:
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                _log(f"[YF] Response error ({yf_ticker}): {exc}")
+                continue
+
+            try:
+                chunk   = data["chart"]["result"][0]
+                ts_list = chunk.get("timestamp") or []
+                quote   = chunk["indicators"]["quote"][0]
+                rows = [
+                    (ts, _to_float(o), _to_float(h), _to_float(l), _to_float(c), _to_float(v))
+                    for ts, o, h, l, c, v in zip(
+                        ts_list,
+                        quote.get("open",   []),
+                        quote.get("high",   []),
+                        quote.get("low",    []),
+                        quote.get("close",  []),
+                        quote.get("volume", []),
+                    )
+                    if ts is not None and not _nan(_to_float(c))
+                ]
+            except (KeyError, TypeError, IndexError):
+                continue
+
+            rows = rows[-TWELVE_OUTPUTSIZE:]
+            if not rows:
+                continue
+            ts_, o_, h_, l_, c_, v_ = map(list, zip(*rows))
+            return Candles(ts_, o_, h_, l_, c_, v_)
+
+    return None
+
+
 def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
     """
-    Fetch OHLCV candles using Twelve Data + Finnhub as parallel sources.
-    Tries Twelve Data first (non-blocking). Falls over to Finnhub immediately
-    if Twelve Data is rate-limited or returns no data. Never blocks.
+    Fetch OHLCV candles with three-tier failover. Never blocks.
 
-    ticker:   Twelve Data ticker (e.g. 'XAU/USD'). Finnhub ticker is looked
-              up via _TD_TO_FH.
+      1. Twelve Data  — fastest, rate-limited (8 req/min free)
+      2. Finnhub      — free for crypto only; forex requires paid plan
+      3. Yahoo Finance — no key, no rate limit, universal coverage
+
+    ticker:   Twelve Data ticker (e.g. 'XAU/USD').
     interval: Twelve Data interval string (e.g. '15min').
     """
     # ── Twelve Data ──────────────────────────────────────────────────────────
@@ -359,8 +477,14 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
         if result is not None:
             return result
 
-    if not TWELVE_API_KEY and not FINNHUB_API_KEY:
-        _log("No API keys configured. Set TWELVE_API_KEY and/or FINNHUB_API_KEY.")
+    # ── Yahoo Finance built-in fallback ──────────────────────────────────────
+    yf_ticker = _TD_TO_YF.get(ticker)
+    if yf_ticker:
+        yf_interval, yf_range = _TD_INT_TO_YF.get(interval, ("15m", "5d"))
+        result = _fetch_from_yahoo(yf_ticker, yf_interval, yf_range)
+        if result is not None:
+            return result
+
     return None
 
 
