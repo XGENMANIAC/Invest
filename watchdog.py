@@ -176,12 +176,19 @@ def _watch_thread(entry: dict) -> None:
         # ── Trigger ───────────────────────────────────────────────────────
         if trig:
             event_type = rule.get("event_type", "INFO")
-            try:
-                notify_event(
-                    event_type, symbol,
-                    rule.get("human_summary", detail),
-                    current_price=cur,
+            candle_ts  = result.get("candle_time")
+            if candle_ts:
+                from datetime import timezone
+                ct = datetime.fromtimestamp(candle_ts, tz=timezone.utc).strftime("%H:%M UTC")
+                price_note = (
+                    f"Triggered on {timeframe} candle closed at {ct}: {cur:.5f}. "
+                    f"Verify current live price before acting."
                 )
+            else:
+                price_note = f"Trigger price (candle close): {cur:.5f}. Verify current live price before acting."
+            notify_body = f"{rule.get('human_summary', detail)}\n{price_note}"
+            try:
+                notify_event(event_type, symbol, notify_body, current_price=cur)
             except Exception as exc:
                 _log(f"[{wid}] Notify error: {exc}")
             _log(f"[{wid}] Alert sent — {event_type} for {symbol} @ {cur:.5f}")

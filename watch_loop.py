@@ -425,6 +425,7 @@ def evaluate_conditions(rule: dict, candles: Candles) -> dict:
         "which":         met_ids,
         "detail":        " | ".join(notes) if notes else "no active conditions",
         "current_price": current_price,
+        "candle_time":   candles.timestamps[-1] if candles.timestamps else None,
     }
 
 # ── APPROACHING HEADS-UP ──────────────────────────────────────────────────────
