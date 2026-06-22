@@ -15,6 +15,8 @@ import os
 import sys
 import time
 import warnings
+import collections
+import threading
 from contextlib import nullcontext
 from datetime import datetime, timezone
 
@@ -32,6 +34,36 @@ if not TWELVE_API_KEY:
         "Market data fetching will fail until it is set.",
         stacklevel=2,
     )
+
+# ── RATE LIMITER (shared across all watch threads) ───────────────────────────
+# Free tier: 8 req/min. Set TWELVE_RATE_LIMIT=55 for Grow/paid tiers.
+TWELVE_RATE_LIMIT = int(os.environ.get("TWELVE_RATE_LIMIT", "8"))
+_rate_lock  = threading.Lock()
+_req_times: collections.deque = collections.deque()
+
+def _rate_wait() -> None:
+    """
+    Sliding-window rate limiter. Blocks until the rate limit allows a request.
+    Sleeps in 0.5s chunks so callers remain cancellable.
+    """
+    window = 60.0
+    while True:
+        with _rate_lock:
+            now = time.time()
+            while _req_times and now - _req_times[0] >= window:
+                _req_times.popleft()
+            if len(_req_times) < TWELVE_RATE_LIMIT:
+                _req_times.append(now)
+                return
+            wait_until = _req_times[0] + window + 0.05
+        wait = wait_until - time.time()
+        if wait > 2.0:
+            _log(
+                f"Rate-limited ({len(_req_times)}/{TWELVE_RATE_LIMIT} req/min used) — "
+                f"pausing {wait:.0f}s. Too many active watches for the free tier. "
+                f"Set TWELVE_RATE_LIMIT=55 if you have a paid plan."
+            )
+        time.sleep(min(max(wait, 0.0), 0.5))  # re-check every 0.5s max
 
 # ── SYMBOL → TICKER MAP ───────────────────────────────────────────────────────
 # Edit here to add instruments. Key = what you type, value = Twelve Data symbol.
@@ -105,7 +137,13 @@ def _to_float(v) -> float:
 
 
 def _resolve_ticker(symbol: str) -> str:
-    key = symbol.upper().replace("/", "").replace("-", "")
+    clean = symbol.upper()
+    # Strip Yahoo Finance-style suffixes that the LLM may hallucinate (=X, =F)
+    for sfx in ("=X", "=F", "="):
+        if clean.endswith(sfx):
+            clean = clean[:-len(sfx)]
+            break
+    key = clean.replace("/", "").replace("-", "")
     if key in SYMBOL_TO_TICKER:
         return SYMBOL_TO_TICKER[key]
     if "/" in symbol:
@@ -156,6 +194,8 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
         _log("TWELVE_API_KEY is not set — cannot fetch market data")
         return None
 
+    _rate_wait()
+
     try:
         resp = requests.get(
             f"{TWELVE_BASE_URL}/time_series",
@@ -172,7 +212,8 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as exc:
-        _log(f"Fetch failed ({ticker}): {exc}")
+        msg = str(exc).replace(TWELVE_API_KEY, "<key>")
+        _log(f"Fetch failed ({ticker}): {msg}")
         return None
 
     if data.get("status") == "error":

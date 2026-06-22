@@ -255,6 +255,9 @@ def _cmd_watch(symbol: str, goal_text_with_flags: str) -> None:
         print("  Rephrase your goal with that detail and try again.\n")
         return
 
+    # User-validated symbol always wins over whatever the parser echoed
+    rule["symbol"] = symbol
+
     # Assign ID and build entry
     with _registry_lock:
         global _watch_counter

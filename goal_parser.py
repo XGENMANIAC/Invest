@@ -56,7 +56,7 @@ OUTPUT SCHEMA — return EXACTLY this shape
 {
   "status": "ok" | "needs_clarification",
   "clarification": "<one-line question if status=needs_clarification, else null>",
-  "symbol": "<ticker, e.g. USDJPY=X>",
+  "symbol": "<echo the SYMBOL from the input exactly as given, e.g. USDJPY>",
   "timeframe": "1m" | "5m" | "15m" | "1h",
   "event_type": "<one of the EXACT strings listed below>",
   "human_summary": "<one short line restating the goal in plain words>",
@@ -269,7 +269,7 @@ def parse_goal(
 
     Args:
         goal_text:     The user's natural-language goal, e.g. "wait for USDJPY retest 160.50".
-        symbol:        The ticker, e.g. "USDJPY=X". Passed to the model as context.
+        symbol:        The ticker as typed by the user, e.g. "USDJPY". Passed to the model as context.
         current_price: Optional current market price (helps model calibrate tolerances).
         levels:        Optional dict of key price levels, e.g. {"support": 160.50, "stop": 159.80}.
 
