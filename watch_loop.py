@@ -588,7 +588,7 @@ def _eval_one(cond: dict, candles: Candles, confirm_bars: int) -> tuple[bool, st
     Evaluate a single condition against current candles.
     Returns (met: bool, human_note: str). Never raises.
     """
-    op    = cond.get("operator", "")
+    op    = (cond.get("operator") or "").strip()
     level = cond.get("level")
     tol   = cond.get("tolerance") or 0.0
     cid   = cond.get("id", "?")
