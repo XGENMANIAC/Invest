@@ -28,7 +28,6 @@ with warnings.catch_warnings():
         SYMBOL_TO_TICKER,
         TIMEFRAME_TO_TWELVE,
         TWELVE_API_KEY,
-        FINNHUB_API_KEY,
         _check_approaching,
         _fetch_candles,
         _is_fresh,
@@ -406,10 +405,9 @@ def _cmd_help() -> None:
 # ── STARTUP ─────────────────────────────────────────────────────────────────────
 
 def _print_banner() -> None:
-    topic_ok   = bool(NTFY_TOPIC and NTFY_TOPIC != _PLACEHOLDER)
-    nim_ok     = bool(NIM_API_KEY)
-    twelve_ok  = bool(TWELVE_API_KEY)
-    finnhub_ok = bool(FINNHUB_API_KEY)
+    topic_ok  = bool(NTFY_TOPIC and NTFY_TOPIC != _PLACEHOLDER)
+    nim_ok    = bool(NIM_API_KEY)
+    twelve_ok = bool(TWELVE_API_KEY)
     W = 56
 
     def row(s: str) -> None:
@@ -421,8 +419,8 @@ def _print_banner() -> None:
     print("╠" + "═" * W + "╣")
     row(f"  Notifier   : ntfy.sh topic  {'[SET]' if topic_ok else '[NOT SET]'}")
     row(f"  Data (pri) : Twelve Data    {'[SET]' if twelve_ok else '[NOT SET]'}")
-    row(f"  Data (2nd) : Finnhub        {'[SET]' if finnhub_ok else '[NOT SET]'}")
-    row(f"  Data (3rd) : Yahoo Finance  [built-in]")
+    row(f"  Data (2nd) : Binance        [built-in]  gold + crypto")
+    row(f"  Data (3rd) : Yahoo Finance  [built-in]  forex pairs")
     row(f"  Parser     : {NIM_MODEL} via NIM")
     row(f"  NIM key    : {'[SET]' if nim_ok else '[NOT SET — parsing disabled]'}")
     print("╠" + "═" * W + "╣")

@@ -6,9 +6,9 @@ already happened once, in goal_parser.py. This loop only does math.
 Execution of any trade stays entirely human-confirmed — this loop notifies only.
 
 Dependencies: requests only (already installed). No pandas. No yfinance library.
-Market data: Twelve Data (primary) → Finnhub (secondary) → Yahoo Finance (built-in fallback).
-TD free tier: 8 req/min. Finnhub free tier: 60 req/min (crypto only on free).
-Yahoo Finance: no key, no rate limit — always available as universal fallback.
+Market data: Twelve Data (primary) → Binance (secondary) → Yahoo Finance (tertiary).
+TD free tier: 8 req/min. Binance public API: free, no key, ~1200 req/min.
+Binance covers gold (PAXG) + crypto. Yahoo Finance covers forex pairs.
 """
 
 import math
@@ -27,23 +27,15 @@ from notify import notify_event
 # ── TWELVE DATA CONFIG ────────────────────────────────────────────────────────
 TWELVE_BASE_URL   = "https://api.twelvedata.com"
 TWELVE_OUTPUTSIZE = 50   # candles per request; 50 covers all indicators + buffer
-TWELVE_RATE_LIMIT = int(os.environ.get("TWELVE_RATE_LIMIT", "8"))  # free: 8/min; paid: 55
+TWELVE_RATE_LIMIT = int(os.environ.get("TWELVE_RATE_LIMIT", "8"))  # free: 8/min; paid: higher
 TWELVE_API_KEY    = os.environ.get("TWELVE_API_KEY", "")
 
-# ── FINNHUB CONFIG ────────────────────────────────────────────────────────────
-FINNHUB_BASE_URL   = "https://finnhub.io/api/v1"
-FINNHUB_RATE_LIMIT = int(os.environ.get("FINNHUB_RATE_LIMIT", "55"))  # free tier: 60/min
-FINNHUB_API_KEY    = os.environ.get("FINNHUB_API_KEY", "")
-
-# ── NON-BLOCKING RATE LIMITERS (per provider, shared across all watch threads) ─
-# Each returns True and records the request if a slot is free; False otherwise.
-# _fetch_candles tries TD first, falls over to FH instantly — never blocks.
+# ── RATE LIMITER (Twelve Data only — Binance/YF have no practical rate limit) ─
+# Returns True and records the request if a slot is free; False otherwise.
+# Never blocks — _fetch_candles falls through to the next source instantly.
 
 _td_lock  = threading.Lock()
 _td_times: collections.deque = collections.deque()
-
-_fh_lock  = threading.Lock()
-_fh_times: collections.deque = collections.deque()
 
 
 def _td_rate_try() -> bool:
@@ -53,17 +45,6 @@ def _td_rate_try() -> bool:
             _td_times.popleft()
         if len(_td_times) < TWELVE_RATE_LIMIT:
             _td_times.append(now)
-            return True
-    return False
-
-
-def _fh_rate_try() -> bool:
-    with _fh_lock:
-        now = time.time()
-        while _fh_times and now - _fh_times[0] >= 60.0:
-            _fh_times.popleft()
-        if len(_fh_times) < FINNHUB_RATE_LIMIT:
-            _fh_times.append(now)
             return True
     return False
 
@@ -86,32 +67,6 @@ SYMBOL_TO_TICKER: dict[str, str] = {
     "SOLUSD": "SOL/USD",
 }
 
-# Fallback: Finnhub symbols — (fh_symbol, endpoint_type)
-# endpoint_type: "forex" | "crypto"  (Finnhub uses separate endpoints per asset class)
-SYMBOL_TO_FH: dict[str, tuple[str, str]] = {
-    "GOLD":   ("OANDA:XAU_USD",  "forex"),
-    "SILVER": ("OANDA:XAG_USD",  "forex"),
-    "OIL":    ("OANDA:BCO_USD",  "forex"),   # Brent crude; WTI not always available on OANDA
-    "EURUSD": ("OANDA:EUR_USD",  "forex"),
-    "GBPUSD": ("OANDA:GBP_USD",  "forex"),
-    "USDJPY": ("OANDA:USD_JPY",  "forex"),
-    "AUDUSD": ("OANDA:AUD_USD",  "forex"),
-    "USDCAD": ("OANDA:USD_CAD",  "forex"),
-    "USDCHF": ("OANDA:USD_CHF",  "forex"),
-    "NZDUSD": ("OANDA:NZD_USD",  "forex"),
-    "BTCUSD": ("BINANCE:BTCUSDT", "crypto"),
-    "ETHUSD": ("BINANCE:ETHUSDT", "crypto"),
-    "BNBUSD": ("BINANCE:BNBUSDT", "crypto"),
-    "SOLUSD": ("BINANCE:SOLUSDT", "crypto"),
-}
-
-# Reverse map: Twelve Data ticker → Finnhub (symbol, type) for _fetch_candles dispatcher
-_TD_TO_FH: dict[str, tuple[str, str]] = {
-    SYMBOL_TO_TICKER[k]: SYMBOL_TO_FH[k]
-    for k in SYMBOL_TO_TICKER
-    if k in SYMBOL_TO_FH
-}
-
 # Twelve Data interval strings per rule timeframe
 TIMEFRAME_TO_TWELVE: dict[str, str] = {
     "1m":  "1min",
@@ -120,12 +75,28 @@ TIMEFRAME_TO_TWELVE: dict[str, str] = {
     "1h":  "1h",
 }
 
-# Finnhub resolution strings per Twelve Data interval string
-_TD_INT_TO_FH_RES: dict[str, str] = {
-    "1min": "1",
-    "5min": "5",
-    "15min": "15",
-    "1h":   "60",
+# ── BINANCE MAPS (secondary source, free, no key, ~1200 req/min) ─────────────
+# PAXG/USDT (Paxos Gold) tracks 1 troy oz spot gold within ~0.1-0.3% —
+# far more accurate than Yahoo Finance GC=F futures ($10-15 premium).
+BINANCE_KLINE_URLS = [
+    "https://api.binance.com/api/v3/klines",
+    "https://api1.binance.com/api/v3/klines",
+    "https://api2.binance.com/api/v3/klines",
+]
+# Twelve Data ticker → Binance symbol
+_TD_TO_BINANCE: dict[str, str] = {
+    "XAU/USD": "PAXGUSDT",   # Paxos Gold — spot-equivalent, backed 1:1 by LBMA gold
+    "BTC/USD": "BTCUSDT",
+    "ETH/USD": "ETHUSDT",
+    "BNB/USD": "BNBUSDT",
+    "SOL/USD": "SOLUSDT",
+}
+# Twelve Data interval string → Binance interval string
+_TD_INT_TO_BINANCE: dict[str, str] = {
+    "1min":  "1m",
+    "5min":  "5m",
+    "15min": "15m",
+    "1h":    "1h",
 }
 
 # ── YAHOO FINANCE MAPS (built-in fallback, no key required) ──────────────────
@@ -312,63 +283,48 @@ def _fetch_from_twelve(ticker: str, interval: str) -> "Candles | None":
         return None
 
 
-def _fetch_from_finnhub(fh_ticker: str, fh_type: str, resolution: str) -> "Candles | None":
+def _fetch_from_binance(bn_symbol: str, bn_interval: str) -> "Candles | None":
     """
-    Fetch from Finnhub candle endpoint. Caller must have already acquired a rate-limit slot.
-    fh_type: 'forex' | 'crypto'  (selects the right Finnhub endpoint)
-    resolution: Finnhub resolution string ('1', '5', '15', '60')
+    Fetch from Binance public klines endpoint. No API key required.
+    Tries multiple load-balanced endpoints; returns on first success.
+    bn_symbol:   e.g. 'PAXGUSDT', 'BTCUSDT'
+    bn_interval: e.g. '15m', '1h'
     """
-    tf_min  = int(resolution) if resolution.isdigit() else 60
-    now_ts  = int(time.time())
-    # 7-day window ensures we get candles even after weekends/holidays
-    from_ts = now_ts - 7 * 24 * 3600
+    params = {"symbol": bn_symbol, "interval": bn_interval, "limit": TWELVE_OUTPUTSIZE}
+    last_err = ""
+    for url in BINANCE_KLINE_URLS:
+        try:
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as exc:
+            last_err = str(exc)
+            continue
 
-    try:
-        resp = requests.get(
-            f"{FINNHUB_BASE_URL}/{fh_type}/candle",
-            params={
-                "symbol":     fh_ticker,
-                "resolution": resolution,
-                "from":       from_ts,
-                "to":         now_ts,
-                "token":      FINNHUB_API_KEY,
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.RequestException as exc:
-        msg = str(exc).replace(FINNHUB_API_KEY, "<key>")
-        _log(f"[FH] Fetch failed ({fh_ticker}): {msg}")
-        return None
+        # Binance kline: [openTime_ms, open, high, low, close, volume, closeTime_ms, ...]
+        try:
+            rows = [
+                (
+                    int(row[0]) / 1000.0,   # open timestamp → Unix seconds
+                    _to_float(row[1]),
+                    _to_float(row[2]),
+                    _to_float(row[3]),
+                    _to_float(row[4]),
+                    _to_float(row[5]),
+                )
+                for row in data
+                if not _nan(_to_float(row[4]))
+            ]
+            if not rows:
+                continue
+            ts_, o_, h_, l_, c_, v_ = map(list, zip(*rows))
+            return Candles(ts_, o_, h_, l_, c_, v_)
+        except (IndexError, TypeError, ValueError):
+            continue
 
-    if data.get("s") != "ok":
-        if data.get("s") == "no_data":
-            _log(f"[FH] No data for {fh_ticker}")
-        else:
-            _log(f"[FH] Error ({fh_ticker}): {data}")
-        return None
-
-    try:
-        rows = [
-            (ts, ov, hv, lv, cv, vv)
-            for ts, ov, hv, lv, cv, vv in zip(
-                data.get("t", []),
-                (_to_float(v) for v in data.get("o", [])),
-                (_to_float(v) for v in data.get("h", [])),
-                (_to_float(v) for v in data.get("l", [])),
-                (_to_float(v) for v in data.get("c", [])),
-                (_to_float(v) for v in data.get("v", [])),
-            )
-            if not _nan(cv)
-        ]
-        rows = rows[-TWELVE_OUTPUTSIZE:]  # keep most recent N candles
-        if not rows:
-            return None
-        ts_, o_, h_, l_, c_, v_ = map(list, zip(*rows))
-        return Candles(ts_, o_, h_, l_, c_, v_)
-    except (KeyError, TypeError, ValueError):
-        return None
+    if last_err:
+        _log(f"[BN] All endpoints failed ({bn_symbol}): {last_err}")
+    return None
 
 
 def _yf_refresh_session() -> bool:
@@ -457,9 +413,9 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
     """
     Fetch OHLCV candles with three-tier failover. Never blocks.
 
-      1. Twelve Data  — fastest, rate-limited (8 req/min free)
-      2. Finnhub      — free for crypto only; forex requires paid plan
-      3. Yahoo Finance — no key, no rate limit, universal coverage
+      1. Twelve Data  — primary, rate-limited (8 req/min free); all symbols
+      2. Binance      — secondary, free, no key, ~1200 req/min; gold + crypto
+      3. Yahoo Finance — tertiary, no key; forex pairs only
 
     ticker:   Twelve Data ticker (e.g. 'XAU/USD').
     interval: Twelve Data interval string (e.g. '15min').
@@ -470,16 +426,15 @@ def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
         if result is not None:
             return result
 
-    # ── Finnhub fallback ─────────────────────────────────────────────────────
-    fh_info = _TD_TO_FH.get(ticker)
-    if fh_info and FINNHUB_API_KEY and _fh_rate_try():
-        fh_ticker, fh_type = fh_info
-        resolution = _TD_INT_TO_FH_RES.get(interval, "15")
-        result = _fetch_from_finnhub(fh_ticker, fh_type, resolution)
+    # ── Binance fallback (gold via PAXG + crypto) ─────────────────────────────
+    bn_symbol = _TD_TO_BINANCE.get(ticker)
+    if bn_symbol:
+        bn_interval = _TD_INT_TO_BINANCE.get(interval, "15m")
+        result = _fetch_from_binance(bn_symbol, bn_interval)
         if result is not None:
             return result
 
-    # ── Yahoo Finance built-in fallback ──────────────────────────────────────
+    # ── Yahoo Finance fallback (forex pairs) ──────────────────────────────────
     yf_ticker = _TD_TO_YF.get(ticker)
     if yf_ticker:
         yf_interval, yf_range = _TD_INT_TO_YF.get(interval, ("15m", "5d"))
