@@ -26,7 +26,8 @@ with warnings.catch_warnings():
     from notify import notify_event, NTFY_TOPIC, _PLACEHOLDER
     from watch_loop import (
         SYMBOL_TO_TICKER,
-        TIMEFRAME_TO_YF,
+        TIMEFRAME_TO_TWELVE,
+        TWELVE_API_KEY,
         _check_approaching,
         _fetch_candles,
         _is_fresh,
@@ -57,8 +58,8 @@ def _get_current_price(symbol: str) -> float | None:
     """Fetch latest price for symbol using the watch_loop data layer. Returns None on failure."""
     try:
         ticker   = _resolve_ticker(symbol)
-        interval, yf_range = TIMEFRAME_TO_YF.get("1m", ("1m", "1d"))
-        candles  = _fetch_candles(ticker, interval, yf_range)
+        interval = TIMEFRAME_TO_TWELVE.get("1m", "1min")
+        candles  = _fetch_candles(ticker, interval)
         if candles and candles.close:
             return float(candles.close[-1])
     except Exception:
@@ -94,7 +95,7 @@ def _watch_thread(entry: dict) -> None:
         _prompt()
         return
 
-    interval, yf_range = TIMEFRAME_TO_YF.get(timeframe, ("15m", "5d"))
+    interval = TIMEFRAME_TO_TWELVE.get(timeframe, "15min")
     start    = time.time()
     deadline = start + window_m * 60 if window_m else None
     heads_up_fired: set = set()
@@ -124,7 +125,7 @@ def _watch_thread(entry: dict) -> None:
 
         # ── Fetch ─────────────────────────────────────────────────────────
         try:
-            candles = _fetch_candles(ticker, interval, yf_range)
+            candles = _fetch_candles(ticker, interval)
         except Exception as exc:
             _log(f"[{wid}] Tick {tick} | Fetch error: {exc} — skipping")
             candles = None
@@ -401,30 +402,38 @@ def _cmd_help() -> None:
 # ── STARTUP ─────────────────────────────────────────────────────────────────────
 
 def _print_banner() -> None:
-    topic_ok = bool(NTFY_TOPIC and NTFY_TOPIC != _PLACEHOLDER)
-    key_ok   = bool(NIM_API_KEY)
+    topic_ok  = bool(NTFY_TOPIC and NTFY_TOPIC != _PLACEHOLDER)
+    nim_ok    = bool(NIM_API_KEY)
+    twelve_ok = bool(TWELVE_API_KEY)
+    W = 56  # inner content width
+
+    def row(s: str) -> None:
+        print(f"║{s.ljust(W)}║")
 
     print()
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║              Trading Watchdog                            ║")
-    print("╠══════════════════════════════════════════════════════════╣")
-    print(f"║  Notifier  : ntfy.sh topic {'[SET]    ' if topic_ok else '[NOT SET]'}                    ║")
-    print(f"║  Parser    : {NIM_MODEL:<20} via NIM  ║")
-    print(f"║  API key   : {'[SET]' if key_ok else '[NOT SET — parsing disabled]'}                            ║")
-    print("╠══════════════════════════════════════════════════════════╣")
-    print("║  This app watches and notifies only. It never places or ║")
-    print("║  modifies trades. When a watch triggers, confirm the    ║")
-    print("║  setup before executing manually.                       ║")
-    print("╚══════════════════════════════════════════════════════════╝")
+    print("╔" + "═" * W + "╗")
+    row("              Trading Watchdog")
+    print("╠" + "═" * W + "╣")
+    row(f"  Notifier  : ntfy.sh topic  {'[SET]' if topic_ok else '[NOT SET]'}")
+    row(f"  Data      : Twelve Data    {'[SET]' if twelve_ok else '[NOT SET — data disabled]'}")
+    row(f"  Parser    : {NIM_MODEL} via NIM")
+    row(f"  NIM key   : {'[SET]' if nim_ok else '[NOT SET — parsing disabled]'}")
+    print("╠" + "═" * W + "╣")
+    row("  This app watches and notifies only. It never places or")
+    row("  modifies trades. When a watch triggers, confirm the")
+    row("  setup before executing manually.")
+    print("╚" + "═" * W + "╝")
     print()
 
 
 def _check_env() -> None:
     warnings_found = []
     if not NIM_API_KEY:
-        warnings_found.append("NIM_API_KEY is not set  →  export NIM_API_KEY=your_nvidia_nim_key")
+        warnings_found.append("NIM_API_KEY is not set    →  export NIM_API_KEY=your_nvidia_nim_key")
+    if not TWELVE_API_KEY:
+        warnings_found.append("TWELVE_API_KEY is not set →  export TWELVE_API_KEY=your_twelvedata_key")
     if not NTFY_TOPIC or NTFY_TOPIC == _PLACEHOLDER:
-        warnings_found.append("NTFY_TOPIC is not set   →  export NTFY_TOPIC=your_secret_topic")
+        warnings_found.append("NTFY_TOPIC is not set     →  export NTFY_TOPIC=your_secret_topic")
 
     if warnings_found:
         print("  [!] Missing environment variables:")

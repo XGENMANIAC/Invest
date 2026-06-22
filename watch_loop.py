@@ -6,44 +6,58 @@ already happened once, in goal_parser.py. This loop only does math.
 Execution of any trade stays entirely human-confirmed — this loop notifies only.
 
 Dependencies: requests only (already installed). No pandas. No yfinance.
-Market data is fetched directly from Yahoo Finance's public JSON API.
+Market data is fetched via the Twelve Data REST API (https://twelvedata.com).
+Requires TWELVE_API_KEY environment variable.
 """
 
 import math
+import os
 import sys
 import time
+import warnings
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
 from notify import notify_event
 
+# ── TWELVE DATA CONFIG ────────────────────────────────────────────────────────
+TWELVE_BASE_URL  = "https://api.twelvedata.com"
+TWELVE_OUTPUTSIZE = 50   # candles per request; 50 covers all indicators + buffer
+TWELVE_API_KEY   = os.environ.get("TWELVE_API_KEY", "")
+if not TWELVE_API_KEY:
+    warnings.warn(
+        "[watch_loop] TWELVE_API_KEY env var is not set. "
+        "Market data fetching will fail until it is set.",
+        stacklevel=2,
+    )
+
 # ── SYMBOL → TICKER MAP ───────────────────────────────────────────────────────
-# Edit here to add instruments. Key = what you type, value = Yahoo Finance ticker.
+# Edit here to add instruments. Key = what you type, value = Twelve Data symbol.
 SYMBOL_TO_TICKER: dict[str, str] = {
-    "GOLD":   "GC=F",
-    "SILVER": "SI=F",
-    "OIL":    "CL=F",
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "JPY=X",
-    "AUDUSD": "AUDUSD=X",
-    "USDCAD": "CAD=X",
-    "USDCHF": "CHF=X",
-    "NZDUSD": "NZDUSD=X",
-    "BTCUSD": "BTC-USD",
-    "ETHUSD": "ETH-USD",
-    "BNBUSD": "BNB-USD",
-    "SOLUSD": "SOL-USD",
+    "GOLD":   "XAU/USD",
+    "SILVER": "XAG/USD",
+    "OIL":    "WTI/USD",
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "AUDUSD": "AUD/USD",
+    "USDCAD": "USD/CAD",
+    "USDCHF": "USD/CHF",
+    "NZDUSD": "NZD/USD",
+    "BTCUSD": "BTC/USD",
+    "ETHUSD": "ETH/USD",
+    "BNBUSD": "BNB/USD",
+    "SOLUSD": "SOL/USD",
 }
 
-# Yahoo Finance API: (yf_interval, yf_range) per rule timeframe
-TIMEFRAME_TO_YF: dict[str, tuple[str, str]] = {
-    "1m":  ("1m",  "1d"),
-    "5m":  ("5m",  "5d"),
-    "15m": ("15m", "5d"),
-    "1h":  ("60m", "30d"),
+# Twelve Data interval strings per rule timeframe
+TIMEFRAME_TO_TWELVE: dict[str, str] = {
+    "1m":  "1min",
+    "5m":  "5min",
+    "15m": "15min",
+    "1h":  "1h",
 }
 
 # How many bars back to look for a price "touch" before checking close confirmation
@@ -51,16 +65,6 @@ TOUCH_LOOKBACK = 5  # bars back to search for a touch; 5 bars keeps it to ~25min
 
 # Price within this multiple of tolerance triggers a one-time APPROACHING heads-up
 APPROACHING_MULTIPLIER = 2.0
-
-# Fallback Yahoo Finance endpoints (tried in order)
-_YF_URLS = [
-    "https://query1.finance.yahoo.com/v8/finance/chart/",
-    "https://query2.finance.yahoo.com/v8/finance/chart/",
-]
-_YF_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
-}
 
 # ── CANDLE DATA STRUCTURE ─────────────────────────────────────────────────────
 
@@ -101,11 +105,11 @@ def _to_float(v) -> float:
 
 
 def _resolve_ticker(symbol: str) -> str:
-    key = symbol.upper().replace("/", "")
+    key = symbol.upper().replace("/", "").replace("-", "")
     if key in SYMBOL_TO_TICKER:
         return SYMBOL_TO_TICKER[key]
-    if any(ch in symbol for ch in ("=", "-")):
-        return symbol  # already a valid Yahoo ticker
+    if "/" in symbol:
+        return symbol.upper()  # already a Twelve Data symbol like EUR/USD
     raise ValueError(
         f"Unknown symbol {symbol!r}. Add it to SYMBOL_TO_TICKER in watch_loop.py."
     )
@@ -133,64 +137,73 @@ def _keep_awake():
         print(f"[watch] wakepy unavailable ({exc}) — continuing without it.", file=sys.stderr)
         return nullcontext()
 
-# ── DATA FETCHING (Yahoo Finance JSON API, no yfinance) ───────────────────────
+# ── DATA FETCHING (Twelve Data REST API) ─────────────────────────────────────
 
-def _fetch_candles(ticker: str, interval: str, yf_range: str) -> Candles | None:
+def _td_ts(dt_str: str) -> float:
+    """Parse a Twelve Data UTC datetime string (YYYY-MM-DD HH:MM:SS) to Unix timestamp."""
+    try:
+        return datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def _fetch_candles(ticker: str, interval: str) -> "Candles | None":
     """
-    Fetch OHLCV candles from Yahoo Finance's public v8 JSON API.
-    Tries two endpoints for resilience. Returns Candles or None on any failure.
+    Fetch OHLCV candles from the Twelve Data time-series endpoint.
+    Returns Candles (ascending, newest last) or None on any failure.
     """
-    last_exc = None
-    data = None
-
-    for base in _YF_URLS:
-        try:
-            resp = requests.get(
-                f"{base}{ticker}",
-                params={"interval": interval, "range": yf_range},
-                headers=_YF_HEADERS,
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            break
-        except requests.RequestException as exc:
-            last_exc = exc
-
-    if data is None:
-        _log(f"Fetch failed ({ticker}): {last_exc}")
+    if not TWELVE_API_KEY:
+        _log("TWELVE_API_KEY is not set — cannot fetch market data")
         return None
 
     try:
-        result = data["chart"]["result"]
-        if not result:
-            _log(f"No chart data returned for {ticker}")
+        resp = requests.get(
+            f"{TWELVE_BASE_URL}/time_series",
+            params={
+                "symbol":     ticker,
+                "interval":   interval,
+                "outputsize": TWELVE_OUTPUTSIZE,
+                "order":      "ASC",
+                "timezone":   "UTC",
+                "apikey":     TWELVE_API_KEY,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as exc:
+        _log(f"Fetch failed ({ticker}): {exc}")
+        return None
+
+    if data.get("status") == "error":
+        _log(f"Twelve Data error ({ticker}): {data.get('message', data)}")
+        return None
+
+    values = data.get("values")
+    if not values:
+        _log(f"No candle data returned for {ticker}")
+        return None
+
+    try:
+        ts_, o_, h_, l_, c_, v_ = [], [], [], [], [], []
+        for row in values:
+            cv = _to_float(row.get("close"))
+            if _nan(cv):
+                continue
+            ts_.append(_td_ts(row["datetime"]))
+            o_.append(_to_float(row.get("open")))
+            h_.append(_to_float(row.get("high")))
+            l_.append(_to_float(row.get("low")))
+            c_.append(cv)
+            v_.append(_to_float(row.get("volume", 0)))
+
+        if not ts_:
+            _log(f"No valid candles after filtering for {ticker}")
             return None
 
-        r         = result[0]
-        timestamps = r.get("timestamp") or []
-        quote      = r["indicators"]["quote"][0]
-
-        def _col(key):
-            return [_to_float(v) for v in (quote.get(key) or [])]
-
-        o, h, lo, c, v = _col("open"), _col("high"), _col("low"), _col("close"), _col("volume")
-
-        # Drop rows where close is NaN (incomplete candles from current open bar)
-        rows = [
-            (ts, ov, hv, lv, cv, vv)
-            for ts, ov, hv, lv, cv, vv in zip(timestamps, o, h, lo, c, v)
-            if not _nan(cv)
-        ]
-
-        if not rows:
-            _log(f"No valid candles for {ticker}")
-            return None
-
-        ts_, o_, h_, l_, c_, v_ = map(list, zip(*rows))
         return Candles(ts_, o_, h_, l_, c_, v_)
 
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError) as exc:
         _log(f"Parse error ({ticker}): {exc}")
         return None
 
@@ -462,7 +475,7 @@ def run_watch(
     on_event:      object = None,
 ) -> None:
     """
-    Poll Yahoo Finance and evaluate the rule on every tick.
+    Poll Twelve Data and evaluate the rule on every tick.
 
     Args:
         rule:          Structured rule dict from goal_parser.parse_goal().
@@ -485,10 +498,10 @@ def run_watch(
         _log(f"Cannot start: {exc}")
         return
 
-    if timeframe not in TIMEFRAME_TO_YF:
+    if timeframe not in TIMEFRAME_TO_TWELVE:
         _log(f"Unknown timeframe {timeframe!r} — defaulting to 15m")
         timeframe = "15m"
-    interval, yf_range = TIMEFRAME_TO_YF[timeframe]
+    interval = TIMEFRAME_TO_TWELVE[timeframe]
 
     start    = time.time()
     deadline = start + window_m * 60 if window_m else None
@@ -522,7 +535,7 @@ def run_watch(
 
             # ── Fetch ─────────────────────────────────────────────────────
             try:
-                candles = _fetch_candles(ticker, interval, yf_range)
+                candles = _fetch_candles(ticker, interval)
             except Exception as exc:
                 _log(f"Tick {tick} | Unexpected error during fetch: {exc} — skipping")
                 candles = None
@@ -651,7 +664,7 @@ if __name__ == "__main__":
     }
 
     print("=" * 60)
-    print("Watch Loop Self-Test  (no pandas, no yfinance)")
+    print("Watch Loop Self-Test  (Twelve Data)")
     print(f"Symbol:  {sample_rule['symbol']}")
     print(f"Level:   {sample_rule['conditions'][0]['level']}")
     print(f"Poll:    15s  |  Window: {sample_rule['window_minutes']}min")
