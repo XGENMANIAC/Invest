@@ -154,8 +154,21 @@ RULE 9 — IN-POSITION GOALS:
   If user says "I'm long", "I'm short", "I'm in a position" → event_type=MANAGE_TRADE (or STOP_RISK if stop-specific).
 
 RULE 10 — APPROACHING vs ENTRY_TRIGGER:
-  "tell me when near / approaching / getting close" → APPROACHING, operator gte/lte.
-  "wait for confirmation / retest / breakout / hold" → ENTRY_TRIGGER, touch_then_close_* or close_*.
+  Use APPROACHING (operator=lte or gte) when the goal is simply to be notified the moment price REACHES a level — no confirmation needed.
+  Use ENTRY_TRIGGER when the goal requires a candle to CLOSE beyond the level or retest and hold.
+
+  APPROACHING patterns (no confirmation language):
+    "drops to X / falls to X / reaches X / hits X / gets to X / when price is at X"
+    "alert me when X / ping me when X / notify when X" (with a bare level, no "and holds")
+    "approaching X / near X / getting close to X / nearing X"
+    operator=lte if price is expected to fall to the level; operator=gte if expected to rise to it.
+
+  ENTRY_TRIGGER patterns (explicit confirmation required):
+    "retest X / retest and hold / bounce off X / breakout above X / close above X / close below X"
+    "confirm / hold / wait for close / break and stay above" (any confirmation language)
+    operator=touch_then_close_above/below or close_above/close_below.
+
+  DEFAULT RULE: if no confirmation language is present, choose APPROACHING. Only use ENTRY_TRIGGER when the user explicitly asks for a candle close confirmation.
 
 OUTPUT: Return ONLY the JSON object. No markdown. No prose. No code fences.
 """
