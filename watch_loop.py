@@ -145,11 +145,13 @@ _YF_UA = (
 _yf_lock:    threading.Lock        = threading.Lock()
 _yf_session: "requests.Session | None" = None
 _yf_crumb:   str                   = ""
-# Twelve Data ticker → Yahoo Finance ticker
+# Twelve Data ticker → Yahoo Finance ticker.
+# NOTE: GC=F / SI=F / CL=F are COMEX *futures* — they trade $10-15 above spot.
+# Excluded from YF fallback so a rate-limited tick returns None (retry) rather
+# than a misleading futures price that could fire an APPROACHING alert early.
+# Forex pairs use the =X quote which IS spot; crypto is exact.
 _TD_TO_YF: dict[str, str] = {
-    "XAU/USD": "GC=F",
-    "XAG/USD": "SI=F",
-    "WTI/USD": "CL=F",
+    # commodities intentionally omitted — no reliable spot equivalent on YF
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "USD/JPY": "USDJPY=X",
