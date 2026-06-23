@@ -118,7 +118,7 @@ RULE 1 — CONFIRMATION LOGIC (most important):
   • "retest [level]"             → same operators, confirm_bars=1
   • "breakout / break above"     → operator=close_above, confirm_bars=1
   • "breakout and hold"          → operator=close_above, confirm_bars=2
-  • "approaching / near"         → operator=lte or gte, event_type=APPROACHING
+  • "approaching / near / rises to / drops to"  → operator=gte (up) or lte (down), event_type=APPROACHING  [see Rule 10 for direction]
   If the goal is vague about confirmation, choose the trading-correct default above and record it in assumptions[].
 
 RULE 2 — LEVELS:
@@ -157,11 +157,29 @@ RULE 10 — APPROACHING vs ENTRY_TRIGGER:
   Use APPROACHING (operator=lte or gte) when the goal is simply to be notified the moment price REACHES a level — no confirmation needed.
   Use ENTRY_TRIGGER when the goal requires a candle to CLOSE beyond the level or retest and hold.
 
+  ⚠ DIRECTION IS CRITICAL — choosing the wrong operator silently misfires:
+    lte fires when  price <= level  →  use ONLY when price must come DOWN to reach the level
+    gte fires when  price >= level  →  use ONLY when price must go   UP  to reach the level
+
+    DOWN-to-level patterns (use operator=lte):
+      "drops to X / falls to X / dips to X / retreats to X / sells off to X"
+      "down to X / decline to X / pull back to X / correct to X"
+
+    UP-to-level patterns (use operator=gte):
+      "rises to X / rallies to X / climbs to X / bounces to X / goes up to X"
+      "up to X / advances to X / pushes to X / reaches X from below"
+
+    Ambiguous direction ("reaches X / hits X / gets to X / at X / near X / approaching X"):
+      → compare CURRENT_PRICE (from context) to X:
+          CURRENT_PRICE < X  →  price must go UP  to reach X  →  operator=gte
+          CURRENT_PRICE > X  →  price must come DOWN to reach X  →  operator=lte
+          CURRENT_PRICE = X  →  already there; prefer gte for safety
+
   APPROACHING patterns (no confirmation language):
     "drops to X / falls to X / reaches X / hits X / gets to X / when price is at X"
-    "alert me when X / ping me when X / notify when X" (with a bare level, no "and holds")
+    "rises to X / rallies to X / climbs to X"
+    "alert me when X / ping me when X / notify when X" (bare level, no "and holds")
     "approaching X / near X / getting close to X / nearing X"
-    operator=lte if price is expected to fall to the level; operator=gte if expected to rise to it.
 
   ENTRY_TRIGGER patterns (explicit confirmation required):
     "retest X / retest and hold / bounce off X / breakout above X / close above X / close below X"
