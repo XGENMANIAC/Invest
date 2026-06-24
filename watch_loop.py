@@ -680,6 +680,10 @@ def evaluate_conditions(rule: dict, candles: Candles) -> dict:
 
 # ── APPROACHING HEADS-UP ──────────────────────────────────────────────────────
 
+_APPROACH_FROM_BELOW = {"gte", "close_above", "touch_then_close_below"}
+_APPROACH_FROM_ABOVE = {"lte", "close_below", "touch_then_close_above"}
+
+
 def _check_approaching(rule: dict, candles: Candles, heads_up_fired: set) -> None:
     """Fire a one-time APPROACHING event when price is within 2× tolerance of a level."""
     symbol = rule["symbol"]
@@ -693,6 +697,14 @@ def _check_approaching(rule: dict, candles: Candles, heads_up_fired: set) -> Non
         tol   = cond.get("tolerance") or 0.0
         if level is None or cid in heads_up_fired:
             continue
+
+        # Direction guard — only fire approaching from the correct side.
+        op = (cond.get("operator") or "").strip()
+        if op in _APPROACH_FROM_BELOW and cur >= level:
+            continue  # waiting for price to rise; don't alert when already above
+        if op in _APPROACH_FROM_ABOVE and cur <= level:
+            continue  # waiting for price to fall; don't alert when already below
+
         if abs(cur - level) <= tol * APPROACHING_MULTIPLIER:
             notify_event(
                 "APPROACHING", symbol,

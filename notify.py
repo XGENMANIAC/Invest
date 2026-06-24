@@ -120,6 +120,13 @@ def notify(
     return False
 
 
+def _fmt_price(price: float) -> str:
+    """Format price with precision matched to the instrument magnitude."""
+    if price < 10:
+        return f"{price:,.5f}"   # forex: GBPUSD 1.31601, EURUSD 1.08543
+    return f"{price:,.2f}"       # everything else: gold 4200.50, JPY 160.50, BTC 68000.00
+
+
 # ──────────────────────────────────────────────────────────────
 # EVENT DISPATCHER
 # ──────────────────────────────────────────────────────────────
@@ -155,7 +162,7 @@ def notify_event(
 
     body = f"{prefix} {message}"
     if current_price is not None:
-        body = f"{prefix} {message}\nPrice: {current_price:,.2f}"
+        body = f"{prefix} {message}\nPrice: {_fmt_price(current_price)}"
 
     return notify(title, body, priority=priority, tags=[tag], click_url=click_url)
 
